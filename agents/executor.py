@@ -43,6 +43,8 @@ ALLOWED_COMMAND_PATTERNS = [
     r"^aws kms get-key-rotation-status",
     r"^aws logs describe-",
     r"^aws sts get-caller-identity$",
+    r"^aws iam simulate-principal-policy",
+    r"^aws iam get-policy-version",
     r"^aws config describe-",
     r"^aws secretsmanager list-",
     r"^aws lambda list-",
@@ -52,7 +54,7 @@ ALLOWED_COMMAND_PATTERNS = [
 # Note: We run with create_subprocess_exec (no shell), so literal $ is safe. We still block
 # shell substitution: $(...) and ${...}. Semicolon, pipe, backtick stay denied.
 HARD_DENY_PATTERNS = [
-    r"[;&|`]",   # shell chaining/pipe/backtick; allow $ so --query "..." and JMESPath work
+    r"[;`]",     # shell chaining/backtick (| and & removed: JMESPath uses both safely inside --query with no-shell exec)
     r"\$\(",     # $(...) command substitution
     r"\$\{",     # ${...} variable expansion
     r">\s*[/\w]",

@@ -103,6 +103,12 @@ async def start_audit(body: AuditStartRequest, background_tasks: BackgroundTasks
 
     def append_event(aid: str, ev: dict) -> None:
         _audit_events[aid].append(ev)
+        # Keep live phase/progress in sync during streaming
+        if ev.get("type") == "phase_update":
+            _audits[aid]["phase"] = ev.get("phase", _audits[aid]["phase"])
+            _audits[aid]["progress"] = ev.get("progress", _audits[aid]["progress"])
+        elif ev.get("type") == "finding":
+            _audits[aid]["findings"].append(ev.get("data", {}))
 
     async def run():
         try:

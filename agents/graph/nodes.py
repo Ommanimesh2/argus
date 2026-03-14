@@ -20,6 +20,21 @@ from agents.graph.checks import (
 from agents.graph.state import AuditStateV3, AuditFinding, InvestigationRecord
 from agents.llm.base import get_llm
 
+
+def _parse_json(text: str) -> any:
+    """Parse JSON, stripping markdown fences if present."""
+    text = text.strip()
+    # Strip ```json ... ``` or ``` ... ``` fences
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # drop first line (```json or ```) and last fence line
+        inner = "\n".join(lines[1:])
+        inner = inner.rstrip("`").rstrip()
+        if inner.endswith("```"):
+            inner = inner[:-3].rstrip()
+        text = inner.strip()
+    return json.loads(text)
+
 RECON_PROMPT = """You are an autonomous infrastructure security auditor performing reconnaissance.
 
 Given these inputs:
@@ -57,7 +72,7 @@ async def reconnaissance_node(state: AuditStateV3) -> dict[str, Any]:
     )
     try:
         reply = await llm.complete([{"role": "user", "content": prompt}], model=FAST_MODEL, max_tokens=800)
-        plan = json.loads(reply) if reply and reply.strip() else {}
+        plan = _parse_json(reply) if reply and reply.strip() else {}
     except (json.JSONDecodeError, Exception):
         plan = {"audit_types_priority": list(scopes), "initial_hypotheses": [], "special_considerations": []}
     audit_types = plan.get("audit_types_priority", list(scopes))
@@ -202,7 +217,7 @@ async def initial_scan_node(state: AuditStateV3) -> dict[str, Any]:
         except Exception:
             reply = "{}"
         try:
-            parsed = json.loads(reply) if reply and reply.strip() else {}
+            parsed = _parse_json(reply) if reply and reply.strip() else {}
             for f in parsed.get("findings", []):
                 f.setdefault("id", f"scan_{len(all_findings)}")
                 f["audit_type"] = check.get("type", "initial_scan")
@@ -444,7 +459,7 @@ async def hypothesis_generation_node(state: AuditStateV3) -> dict[str, Any]:
                 model=FAST_MODEL,
                 max_tokens=2000,
             )
-            parsed = json.loads(reply) if reply and reply.strip() else []
+            parsed = _parse_json(reply) if reply and reply.strip() else []
             if isinstance(parsed, list):
                 for hyp in parsed:
                     if hyp.get("id") and hyp["id"] not in existing_ids:
@@ -569,7 +584,7 @@ async def deep_investigation_node(state: AuditStateV3) -> dict[str, Any]:
                 model=FAST_MODEL,
                 max_tokens=3000,
             )
-            parsed = json.loads(reply) if reply and reply.strip() else {}
+            parsed = _parse_json(reply) if reply and reply.strip() else {}
         except (json.JSONDecodeError, TypeError):
             parsed = {}
         tokens_used += 2000
@@ -685,7 +700,7 @@ async def attack_graph_node(state: AuditStateV3) -> dict[str, Any]:
             model=DEEP_MODEL,
             max_tokens=3000,
         )
-        data = json.loads(reply) if reply and reply.strip() else {}
+        data = _parse_json(reply) if reply and reply.strip() else {}
     except (json.JSONDecodeError, TypeError):
         data = {}
     nodes = {n["id"]: n for n in data.get("nodes", []) if n.get("id")}
@@ -758,7 +773,7 @@ async def reasoning_node(state: AuditStateV3) -> dict[str, Any]:
             model=DEEP_MODEL,
             max_tokens=4000,
         )
-        data = json.loads(reply) if reply and reply.strip() else {}
+        data = _parse_json(reply) if reply and reply.strip() else {}
     except (json.JSONDecodeError, TypeError):
         data = {}
     reasoning_chains = data.get("reasoning_chains", [])
