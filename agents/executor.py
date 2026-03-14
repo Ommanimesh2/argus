@@ -49,9 +49,12 @@ ALLOWED_COMMAND_PATTERNS = [
 ]
 
 # Hard deny: reject before allowlist check (AGENT_ACCESS_MODEL §5.2)
+# Note: We run with create_subprocess_exec (no shell), so literal $ is safe. We still block
+# shell substitution: $(...) and ${...}. Semicolon, pipe, backtick stay denied.
 HARD_DENY_PATTERNS = [
-    r"[;&|`$]",
-    r"\$\(",
+    r"[;&|`]",   # shell chaining/pipe/backtick; allow $ so --query "..." and JMESPath work
+    r"\$\(",     # $(...) command substitution
+    r"\$\{",     # ${...} variable expansion
     r">\s*[/\w]",
     r"<\(",
     r"\|\s*bash",
