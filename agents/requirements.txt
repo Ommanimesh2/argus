@@ -1,7 +1,11 @@
 # ARGUS Agents — LangGraph pipeline + APIs (Claude + OpenAI)
 
-# LangGraph & state machine
+# LangGraph & state machine (align with StateGraph, END, MemorySaver)
 langgraph
+langchain-core
+
+# Tracing
+langsmith
 
 # LLM providers
 anthropic

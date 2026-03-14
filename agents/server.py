@@ -1,6 +1,6 @@
 """
 ARGUS Agents — FastAPI app: audit start, SSE stream, report.
-API-first; full LangGraph pipeline can be wired behind these endpoints.
+API-first; LangGraph V3 pipeline wired behind these endpoints.
 """
 import asyncio
 import json
@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from agents.config import ORIGINS, get_required_api_key
+from agents.graph.workflow import run_audit_graph
 
 app = FastAPI(
     title="ARGUS Agents API",
@@ -73,27 +74,26 @@ async def start_audit(body: AuditStartRequest, background_tasks: BackgroundTasks
     }
     _audit_events[audit_id] = []
 
-    # In a full implementation: background_tasks.add_task(run_audit_graph, audit_id, body)
-    async def stub_run():
-        await asyncio.sleep(0.5)
-        _audit_events[audit_id].append({
-            "type": "phase_update",
-            "phase": "reconnaissance",
-            "progress": 0.1,
-        })
-        await asyncio.sleep(0.3)
-        _audit_events[audit_id].append({
-            "type": "phase_update",
-            "phase": "initial_scan",
-            "progress": 0.35,
-        })
-        await asyncio.sleep(0.2)
-        _audits[audit_id]["phase"] = "complete"
-        _audits[audit_id]["progress"] = 1.0
-        _audits[audit_id]["finished"] = True
-        _audit_events[audit_id].append({"type": "complete"})
+    def append_event(aid: str, ev: dict) -> None:
+        _audit_events[aid].append(ev)
 
-    background_tasks.add_task(stub_run)
+    async def run():
+        try:
+            body_dict = body.model_dump()
+            final = await run_audit_graph(audit_id, body_dict, append_event)
+            if final:
+                _audits[audit_id]["phase"] = final.get("current_phase", "complete")
+                _audits[audit_id]["progress"] = final.get("phase_progress", 1.0)
+                _audits[audit_id]["findings"] = final.get("all_findings", [])
+                _audits[audit_id]["report"] = final.get("external_report") or final.get("executive_summary", "")
+                _audits[audit_id]["attack_paths"] = final.get("attack_paths", [])
+            _audits[audit_id]["finished"] = True
+        except Exception as e:
+            append_event(audit_id, {"type": "error", "error": str(e)})
+            _audits[audit_id]["phase"] = "error"
+            _audits[audit_id]["finished"] = True
+
+    background_tasks.add_task(run)
 
     return AuditStartResponse(
         audit_id=audit_id,

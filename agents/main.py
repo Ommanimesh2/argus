@@ -2,8 +2,8 @@
 ARGUS Agents — entrypoint. Runs FastAPI server (audit start, stream, report).
 Usage (from repo root): python -m agents.main
 """
-from agents.config import HOST, PORT, LOG_LEVEL
-from agents.server import app
+from .config import HOST, PORT, LOG_LEVEL
+from .server import app
 
 if __name__ == "__main__":
     import uvicorn

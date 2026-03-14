@@ -31,6 +31,27 @@ ORIGINS = [o.strip() for o in os.getenv("ORIGINS", "http://localhost:3000").spli
 AUDIT_TIMEOUT_SECONDS = int(os.getenv("AUDIT_TIMEOUT_SECONDS", "300"))
 COMMAND_TIMEOUT_SECONDS = int(os.getenv("COMMAND_TIMEOUT_SECONDS", "60"))
 
+# Phase-3 audit mode and budgets
+AUDIT_MODE = os.getenv("AUDIT_MODE", "demo").strip().lower()
+if AUDIT_MODE not in ("demo", "dev"):
+    AUDIT_MODE = "demo"
+IS_DEMO_MODE = AUDIT_MODE == "demo"
+IS_DEV_MODE = AUDIT_MODE == "dev"
+
+INVESTIGATION_BUDGET = int(os.getenv("INVESTIGATION_BUDGET", "20" if IS_DEMO_MODE else "50"))
+TOKEN_BUDGET = int(os.getenv("TOKEN_BUDGET", "60000"))
+
+# Per-node model selection (fast for discovery/hypothesis, deep for reasoning/report)
+FAST_MODEL = os.getenv("FAST_MODEL", "claude-sonnet-4-20250514" if LLM_PROVIDER == "claude" else "gpt-4o")
+DEEP_MODEL = os.getenv("DEEP_MODEL", "claude-sonnet-4-20250514" if LLM_PROVIDER == "claude" else "gpt-4o")
+
+# LangSmith tracing (optional)
+LANGSMITH_TRACING = os.getenv("LANGSMITH_TRACING", "").strip().lower() in ("true", "1", "yes")
+LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY", "").strip() or os.getenv("LANGSMITH_API_KEY", "").strip()
+if LANGSMITH_TRACING and LANGCHAIN_API_KEY:
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_API_KEY"] = LANGCHAIN_API_KEY
+
 
 def get_required_api_key() -> str:
     """Return the API key required for the selected provider; raise if missing."""
