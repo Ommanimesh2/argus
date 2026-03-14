@@ -115,18 +115,84 @@ async def run_audit_graph(audit_id: str, body: dict[str, Any], events_append: ca
 
     try:
         final_state = None
+        prev_findings_count = 0
+        prev_hyp_count = 0
+        prev_paths_count = 0
+        prev_chains_count = 0
+        prev_log_count = 0
+        prev_budget: int | None = None
+        prev_hyp_statuses: dict[str, str] = {}
+
         async for state in compiled.astream(initial, config=config, stream_mode="values"):
             final_state = state
+
+            # Phase update (always)
             phase = state.get("current_phase", "")
-            progress = state.get("phase_progress")
+            progress = state.get("phase_progress", 0.0)
             logger.info("graph phase audit_id=%s phase=%s progress=%s", audit_id, phase, progress)
             events_append(audit_id, {
                 "type": "phase_update",
                 "phase": phase,
                 "progress": progress,
             })
+
+            # New findings
+            all_findings = state.get("all_findings", [])
+            for f in all_findings[prev_findings_count:]:
+                events_append(audit_id, {"type": "finding", "data": dict(f)})
+            prev_findings_count = len(all_findings)
+
+            # Hypotheses: new ones + status changes on existing
+            hypotheses = state.get("hypotheses", [])
+            for h in hypotheses[prev_hyp_count:]:
+                events_append(audit_id, {"type": "hypothesis_generated", "data": dict(h)})
+            for h in hypotheses[:prev_hyp_count]:
+                hid = h.get("id", "")
+                status = h.get("status", "")
+                if status != prev_hyp_statuses.get(hid) and status in ("confirmed", "rejected", "inconclusive"):
+                    events_append(audit_id, {"type": "investigation_result", "data": {
+                        "hypothesis_id": hid,
+                        "status": status,
+                        "evidence_summary": h.get("result", ""),
+                    }})
+            prev_hyp_count = len(hypotheses)
+            prev_hyp_statuses = {h.get("id", ""): h.get("status", "") for h in hypotheses}
+
+            # Budget update
+            budget_remaining = state.get("investigation_budget_remaining")
+            budget_total = state.get("investigation_budget_total", INVESTIGATION_BUDGET)
+            if budget_remaining is not None and budget_remaining != prev_budget:
+                events_append(audit_id, {"type": "budget_update", "data": {
+                    "total": budget_total,
+                    "remaining": budget_remaining,
+                    "spent": budget_total - budget_remaining,
+                }})
+                prev_budget = budget_remaining
+
+            # New attack paths
+            paths = state.get("attack_paths", [])
+            for p in paths[prev_paths_count:]:
+                events_append(audit_id, {"type": "attack_path_discovered", "data": dict(p)})
+            prev_paths_count = len(paths)
+
+            # New reasoning chains
+            chains = state.get("reasoning_chains", [])
+            for c in chains[prev_chains_count:]:
+                events_append(audit_id, {"type": "reasoning_chain", "data": dict(c)})
+            prev_chains_count = len(chains)
+
+            # New audit log entries
+            audit_log = state.get("audit_log", [])
+            for entry in audit_log[prev_log_count:]:
+                events_append(audit_id, {"type": "log", "data": {
+                    "level": "info",
+                    "source": entry.get("event", "system"),
+                    "message": str(entry),
+                }})
+            prev_log_count = len(audit_log)
+
         if final_state is not None:
-            events_append(audit_id, {"type": "complete", "state": final_state})
+            events_append(audit_id, {"type": "complete"})
         logger.info("graph run completed audit_id=%s", audit_id)
         return final_state
     except Exception as e:
