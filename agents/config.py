@@ -46,7 +46,7 @@ if AUDIT_MODE not in ("demo", "dev"):
 IS_DEMO_MODE = AUDIT_MODE == "demo"
 IS_DEV_MODE = AUDIT_MODE == "dev"
 
-INVESTIGATION_BUDGET = int(os.getenv("INVESTIGATION_BUDGET", "20" if IS_DEMO_MODE else "50"))
+INVESTIGATION_BUDGET = int(os.getenv("INVESTIGATION_BUDGET", "10" if IS_DEMO_MODE else "50"))
 TOKEN_BUDGET = int(os.getenv("TOKEN_BUDGET", "60000"))
 
 # AWS — used by SecureToolExecutor and nodes that run AWS CLI

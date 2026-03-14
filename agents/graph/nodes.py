@@ -2,6 +2,7 @@
 ARGUS Agents — V3 graph nodes.
 Uses get_llm() from agents.llm.base and SecureToolExecutor for AWS CLI.
 """
+import asyncio
 import json
 import re
 from collections import defaultdict
@@ -100,25 +101,25 @@ async def reconnaissance_node(state: AuditStateV3) -> dict[str, Any]:
         "--filters \"Name=tag:Name,Values=audit-jumpbox\" \"Name=instance-state-name,Values=running\" "
         "--query \"Reservations[0].Instances[0].PublicIpAddress\" --output text"
     )
-    jb_result = await executor.execute(jb_cmd, timeout=30)
-    if jb_result.returncode == 0 and jb_result.stdout.strip() and jb_result.stdout.strip() != "None":
-        jump_box_ip = jb_result.stdout.strip()
-
     ext_cmd = (
         "aws ec2 describe-instances "
         f"--filters \"Name=tag:{scope_tag},Values={scope_tag}\" \"Name=instance-state-name,Values=running\" "
         "--query \"Reservations[].Instances[?PublicIpAddress].PublicIpAddress\" --output text"
     )
-    ext_result = await executor.execute(ext_cmd, timeout=30)
-    if ext_result.returncode == 0 and ext_result.stdout.strip():
-        external_targets = [ip for ip in ext_result.stdout.split() if ip and ip != "None"]
-
     int_cmd = (
         "aws ec2 describe-instances "
         f"--filters \"Name=tag:{scope_tag},Values={scope_tag}\" \"Name=instance-state-name,Values=running\" "
         "--query \"Reservations[].Instances[?!PublicIpAddress].PrivateIpAddress\" --output text"
     )
-    int_result = await executor.execute(int_cmd, timeout=30)
+    jb_result, ext_result, int_result = await asyncio.gather(
+        executor.execute(jb_cmd, timeout=15),
+        executor.execute(ext_cmd, timeout=15),
+        executor.execute(int_cmd, timeout=15),
+    )
+    if jb_result.returncode == 0 and jb_result.stdout.strip() and jb_result.stdout.strip() != "None":
+        jump_box_ip = jb_result.stdout.strip()
+    if ext_result.returncode == 0 and ext_result.stdout.strip():
+        external_targets = [ip for ip in ext_result.stdout.split() if ip and ip != "None"]
     if int_result.returncode == 0 and int_result.stdout.strip():
         internal_targets = [ip for ip in int_result.stdout.split() if ip and ip != "None"]
 
@@ -193,9 +194,10 @@ async def initial_scan_node(state: AuditStateV3) -> dict[str, Any]:
     total_tokens_used = state.get("tokens_used", 0)
 
     for check_id, check in active_checks.items():
+        cmds = check.get("commands", [])
+        results = await asyncio.gather(*(executor.execute(cmd, timeout=15) for cmd in cmds))
         outputs: list[str] = []
-        for cmd in check.get("commands", []):
-            result = await executor.execute(cmd, timeout=30)
+        for cmd, result in zip(cmds, results):
             clean = (result.stdout or "").strip()[:3000]
             if result.returncode != 0 and result.stderr:
                 clean = f"[stderr] {result.stderr}\n{clean}"
@@ -559,7 +561,7 @@ async def deep_investigation_node(state: AuditStateV3) -> dict[str, Any]:
     )
     if not pending or budget <= 0:
         return {"current_phase": "investigation_complete", "investigation_budget_remaining": budget}
-    batch_size = min(3, len(pending), budget)
+    batch_size = min(5, len(pending), budget)
     batch = pending[:batch_size]
     executor = SecureToolExecutor()
     llm = get_llm()
@@ -570,12 +572,11 @@ async def deep_investigation_node(state: AuditStateV3) -> dict[str, Any]:
 
     for h in batch:
         commands = _determine_investigation_commands(h)
+        results = await asyncio.gather(*(executor.execute(cmd, timeout=15) for cmd in commands))
         outputs: list[str] = []
-        cmds_run: list[str] = []
-        for cmd in commands:
-            result = await executor.execute(cmd, timeout=30)
+        for cmd, result in zip(commands, results):
             outputs.append(f"[{cmd}]\n{(result.stdout or '').strip()[:3000]}")
-            cmds_run.append(cmd)
+        cmds_run = list(commands)
         command_outputs = "\n\n".join(outputs)
 
         try:
