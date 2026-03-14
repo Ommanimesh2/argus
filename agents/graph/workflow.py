@@ -7,7 +7,7 @@ from typing import Any
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
-from agents.config import IS_DEMO_MODE, INVESTIGATION_BUDGET, TOKEN_BUDGET
+from agents.config import IS_DEMO_MODE, INVESTIGATION_BUDGET, TOKEN_BUDGET, logger
 from agents.graph.state import AuditStateV3
 
 
@@ -81,6 +81,7 @@ async def run_audit_graph(audit_id: str, body: dict[str, Any], events_append: ca
         "ssh_key_path": body.get("ssh_key_path", ""),
         "aws_region": body.get("aws_region", "us-east-1"),
         "scope_tag": body.get("scope_tag", "AuditDemo"),
+        "scopes": body.get("scopes", ["all"]),
         "context_file_path": body.get("context_file_path"),
         "external_targets": body.get("external_targets", []),
         "internal_targets": body.get("internal_targets", []),
@@ -110,18 +111,25 @@ async def run_audit_graph(audit_id: str, body: dict[str, Any], events_append: ca
     compiled = build_v3_graph()
     config = {"configurable": {"thread_id": audit_id}}
 
+    logger.info("graph run started audit_id=%s mode=%s", audit_id, initial.get("audit_mode"))
+
     try:
         final_state = None
         async for state in compiled.astream(initial, config=config, stream_mode="values"):
             final_state = state
+            phase = state.get("current_phase", "")
+            progress = state.get("phase_progress")
+            logger.info("graph phase audit_id=%s phase=%s progress=%s", audit_id, phase, progress)
             events_append(audit_id, {
                 "type": "phase_update",
-                "phase": state.get("current_phase", ""),
-                "progress": state.get("phase_progress"),
+                "phase": phase,
+                "progress": progress,
             })
         if final_state is not None:
             events_append(audit_id, {"type": "complete", "state": final_state})
+        logger.info("graph run completed audit_id=%s", audit_id)
         return final_state
     except Exception as e:
+        logger.exception("graph run error audit_id=%s", audit_id)
         events_append(audit_id, {"type": "error", "error": str(e)})
         return None

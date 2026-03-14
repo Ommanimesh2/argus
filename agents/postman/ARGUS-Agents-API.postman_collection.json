@@ -1,0 +1,84 @@
+{
+  "info": {
+    "name": "ARGUS Agents API",
+    "description": "Health, start audit, stream, status, report. Uses infra from AWS_Roles.md. Set baseUrl to your server; fill ssh_key_path when you have the key for internal access.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8000" },
+    { "key": "audit_id", "value": "" },
+    { "key": "vpc_id", "value": "vpc-08f981140c110f0f8" },
+    { "key": "ec2_public_ip", "value": "13.217.89.58" },
+    { "key": "ec2_private_ip", "value": "10.0.10.100" },
+    { "key": "jumpbox_ip", "value": "184.73.74.141" },
+    { "key": "rds_endpoint", "value": "audit-demo-db.cilos4a8gume.us-east-1.rds.amazonaws.com:5432" },
+    { "key": "audit_agent_role_arn", "value": "arn:aws:iam::459281873221:role/audit-agent-role" },
+    { "key": "secrets_arn", "value": "arn:aws:secretsmanager:us-east-1:459281873221:secret:audit/api-key-sXLT7D" },
+    { "key": "ssh_key_path", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/health",
+        "description": "Liveness/readiness check."
+      }
+    },
+    {
+      "name": "Start audit",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 200) {",
+              "  const j = pm.response.json();",
+              "  if (j.audit_id) pm.collectionVariables.set('audit_id', j.audit_id);",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"scopes\": [\"all\"],\n  \"external_targets\": [\"{{ec2_public_ip}}\"],\n  \"internal_targets\": [\"{{ec2_private_ip}}\", \"{{rds_endpoint}}\"],\n  \"jump_box_ip\": \"{{jumpbox_ip}}\",\n  \"ssh_key_path\": \"{{ssh_key_path}}\",\n  \"environment_context\": {\n    \"vpc_id\": \"{{vpc_id}}\",\n    \"audit_agent_role_arn\": \"{{audit_agent_role_arn}}\",\n    \"secrets_arn\": \"{{secrets_arn}}\"\n  }\n}"
+        },
+        "url": "{{baseUrl}}/api/audit/start",
+        "description": "Start audit with infra from AWS_Roles.md. external_targets=EC2 public; internal_targets=EC2 private + RDS; jump_box_ip for bastion; ssh_key_path (set when you have the key). Saves audit_id for stream/status/report."
+      }
+    },
+    {
+      "name": "Stream audit (SSE)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/api/audit/{{audit_id}}/stream",
+        "description": "Server-Sent Events stream. Use audit_id from Start audit. In Postman you see raw SSE lines; for live consumption use a client that handles text/event-stream."
+      }
+    },
+    {
+      "name": "Audit status",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/api/audit/{{audit_id}}/status",
+        "description": "Current phase, progress, finished, findings_count."
+      }
+    },
+    {
+      "name": "Audit report",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/api/audit/{{audit_id}}/report",
+        "description": "Final report. Returns 202 if audit not finished yet."
+      }
+    }
+  ]
+}

@@ -1,76 +1,235 @@
 """
-ARGUS Agents — V3 graph nodes (stub/minimal implementations).
-All use get_llm() from agents.llm.base; real logic and SecureToolExecutor are follow-ups.
+ARGUS Agents — V3 graph nodes.
+Uses get_llm() from agents.llm.base and SecureToolExecutor for AWS CLI.
 """
 import json
 import re
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from agents.config import INVESTIGATION_BUDGET, TOKEN_BUDGET, FAST_MODEL, DEEP_MODEL
+from agents.config import TOKEN_BUDGET, FAST_MODEL, DEEP_MODEL
+from agents.executor import SecureToolExecutor
+from agents.graph.checks import (
+    resolve_scopes,
+    calculate_budget,
+    get_active_checks,
+    ALL_SCOPES,
+)
 from agents.graph.state import AuditStateV3, AuditFinding, InvestigationRecord
 from agents.llm.base import get_llm
 
+RECON_PROMPT = """You are an autonomous infrastructure security auditor performing reconnaissance.
+
+Given these inputs:
+- AWS Region:  {aws_region}
+- Scope tag:   {scope_tag}
+- Active scopes: {scopes}
+
+IMPORTANT: Only plan checks relevant to the active scopes.
+
+Produce a JSON audit plan:
+{{
+    "audit_types_priority": ["most_important_first", ...],
+    "initial_hypotheses": [
+        "Are there IAM roles that can chain into higher-privilege roles?",
+        ...
+    ],
+    "special_considerations": []
+}}
+
+Return ONLY valid JSON, no markdown."""
+
 
 async def reconnaissance_node(state: AuditStateV3) -> dict[str, Any]:
-    """Build audit plan from targets; call LLM; return state with audit_types_executed, budget, initial hypotheses."""
-    llm = get_llm()
-    prompt = f"""You are an infrastructure security auditor. Given targets:
-- External: {state.get('external_targets', [])}
-- Internal: {state.get('internal_targets', [])}
-- Jump box: {state.get('jump_box_ip', 'N/A')}
+    """Demo mode: resolve scopes, compute budget, LLM plan, then AWS discovery for jump box and targets."""
+    scopes = resolve_scopes(state.get("scopes", ["all"]))
+    budget = calculate_budget(scopes, state.get("audit_mode", "demo"))
+    scope_tag = state.get("scope_tag", "AuditDemo")
+    aws_region = state.get("aws_region", "us-east-1")
 
-Produce a JSON object with: "audit_types_priority" (array of 2-3 types), "initial_hypotheses" (array of 1-2 questions).
-Return ONLY valid JSON."""
+    llm = get_llm()
+    prompt = RECON_PROMPT.format(
+        aws_region=aws_region,
+        scope_tag=scope_tag,
+        scopes=", ".join(scopes),
+    )
     try:
         reply = await llm.complete([{"role": "user", "content": prompt}], model=FAST_MODEL, max_tokens=800)
-        plan = json.loads(reply) if reply.strip() else {}
+        plan = json.loads(reply) if reply and reply.strip() else {}
     except (json.JSONDecodeError, Exception):
-        plan = {"audit_types_priority": ["iam_privilege", "network_segmentation"], "initial_hypotheses": []}
-    audit_types = plan.get("audit_types_priority", ["iam_privilege", "network_segmentation"])
+        plan = {"audit_types_priority": list(scopes), "initial_hypotheses": [], "special_considerations": []}
+    audit_types = plan.get("audit_types_priority", list(scopes))
     initial_hypotheses = [
-        {"id": f"recon_hyp_{i}", "question": q, "status": "pending", "priority": 0.75, "triggered_by": "reconnaissance", "audit_type": audit_types[0] if audit_types else "general", "depth": 0}
+        {
+            "id": f"recon_hyp_{i}",
+            "question": q,
+            "status": "pending",
+            "priority": 0.75,
+            "triggered_by": "reconnaissance",
+            "audit_type": audit_types[0] if audit_types else "general",
+            "depth": 0,
+        }
         for i, q in enumerate(plan.get("initial_hypotheses", []))
     ]
+
+    # AWS discovery: jump box and targets by tag
+    executor = SecureToolExecutor()
+    jump_box_ip = ""
+    external_targets: list[str] = []
+    internal_targets: list[str] = []
+
+    jb_cmd = (
+        "aws ec2 describe-instances "
+        "--filters \"Name=tag:Name,Values=audit-jumpbox\" \"Name=instance-state-name,Values=running\" "
+        "--query \"Reservations[0].Instances[0].PublicIpAddress\" --output text"
+    )
+    jb_result = await executor.execute(jb_cmd, timeout=30)
+    if jb_result.returncode == 0 and jb_result.stdout.strip() and jb_result.stdout.strip() != "None":
+        jump_box_ip = jb_result.stdout.strip()
+
+    ext_cmd = (
+        "aws ec2 describe-instances "
+        f"--filters \"Name=tag:{scope_tag},Values={scope_tag}\" \"Name=instance-state-name,Values=running\" "
+        "--query \"Reservations[].Instances[?PublicIpAddress].PublicIpAddress\" --output text"
+    )
+    ext_result = await executor.execute(ext_cmd, timeout=30)
+    if ext_result.returncode == 0 and ext_result.stdout.strip():
+        external_targets = [ip for ip in ext_result.stdout.split() if ip and ip != "None"]
+
+    int_cmd = (
+        "aws ec2 describe-instances "
+        f"--filters \"Name=tag:{scope_tag},Values={scope_tag}\" \"Name=instance-state-name,Values=running\" "
+        "--query \"Reservations[].Instances[?!PublicIpAddress].PrivateIpAddress\" --output text"
+    )
+    int_result = await executor.execute(int_cmd, timeout=30)
+    if int_result.returncode == 0 and int_result.stdout.strip():
+        internal_targets = [ip for ip in int_result.stdout.split() if ip and ip != "None"]
+
+    tokens_used = 0  # optional: track from LLM response if API provides it
+    token_remaining = state.get("token_budget_remaining", TOKEN_BUDGET) - tokens_used
+
     return {
-        "audit_types_executed": audit_types,
-        "investigation_budget_total": INVESTIGATION_BUDGET,
-        "investigation_budget_remaining": INVESTIGATION_BUDGET,
-        "investigation_depth_max": 5,
-        "token_budget_remaining": state.get("token_budget_remaining", TOKEN_BUDGET),
+        "scopes": scopes,
+        "jump_box_ip": jump_box_ip,
+        "external_targets": external_targets,
+        "internal_targets": internal_targets,
         "hypotheses": initial_hypotheses,
+        "investigation_budget_total": budget,
+        "investigation_budget_remaining": budget,
+        "investigation_depth_max": 5,
+        "tokens_used": state.get("tokens_used", 0) + tokens_used,
+        "token_budget_remaining": token_remaining,
+        "audit_types_executed": audit_types,
         "current_phase": "reconnaissance_complete",
         "phase_progress": 0.1,
-        "audit_log": state.get("audit_log", []) + [{"timestamp": datetime.utcnow().isoformat(), "event": "reconnaissance_complete", "plan": plan}],
+        "audit_log": state.get("audit_log", []) + [
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": "reconnaissance_complete",
+                "plan": plan,
+                "scopes": scopes,
+                "budget": budget,
+                "jump_box_ip": jump_box_ip,
+                "external_targets": external_targets,
+                "internal_targets": internal_targets,
+            }
+        ],
     }
 
 
+INITIAL_SCAN_PROMPT = """You are an autonomous infrastructure auditor. Analyze the scan results below.
+
+CHECK: {check_name} ({scan_type})
+INSTRUCTIONS: {analysis_prompt}
+
+RAW OUTPUT:
+{raw_output}
+
+Produce a JSON object:
+{{
+  "findings": [
+    {{
+      "id": "scan_N",
+      "title": "Short title",
+      "type": "security_group_allows_port|iam_role_can_assume_role|nacl_has_deny_rule|monitoring_configured|encryption_disabled|config_drift|other",
+      "severity": "CRITICAL|HIGH|MEDIUM|LOW|INFO",
+      "description": "What was found",
+      "evidence": "The specific data supporting this",
+      "context": {{}},
+      "is_suspicious": true,
+      "suspicion_reason": "Why this needs deeper investigation"
+    }}
+  ]
+}}
+
+Think like a penetration tester. Flag anything that looks benign but could be dangerous in combination.
+Return ONLY valid JSON."""
+
+
 async def initial_scan_node(state: AuditStateV3) -> dict[str, Any]:
-    """Stub: produce a few mock initial_findings. Later: ACTIVE_CHECKS + SecureToolExecutor."""
-    mock_findings: list[AuditFinding] = [
-        {
-            "id": "scan_1",
-            "title": "Mock finding (stub)",
-            "type": "general",
-            "severity": "LOW",
-            "audit_type": "initial_scan",
-            "description": "Stub initial scan — wire real checks later.",
-            "evidence": "",
-            "context": {},
-            "risk_score": 0.3,
-            "cis_benchmark": None,
-            "remediation": "",
-            "discovered_by": "initial_scan",
-            "reasoning_chain": None,
-        }
-    ]
+    """Run active discovery checks via SecureToolExecutor; one LLM call per check; merge findings."""
+    scopes = state.get("scopes", ALL_SCOPES)
+    active_checks = get_active_checks(scopes)
+    executor = SecureToolExecutor()
+    llm = get_llm()
+    all_findings: list[AuditFinding] = []
+    total_tokens_used = state.get("tokens_used", 0)
+
+    for check_id, check in active_checks.items():
+        outputs: list[str] = []
+        for cmd in check.get("commands", []):
+            result = await executor.execute(cmd, timeout=30)
+            clean = (result.stdout or "").strip()[:3000]
+            if result.returncode != 0 and result.stderr:
+                clean = f"[stderr] {result.stderr}\n{clean}"
+            outputs.append(f"[{cmd}]\n{clean}")
+
+        raw_output = "\n\n".join(outputs)
+        prompt = INITIAL_SCAN_PROMPT.format(
+            check_name=check["name"],
+            scan_type=check.get("type", "general"),
+            analysis_prompt=check.get("analysis_prompt", "Analyze for security issues."),
+            raw_output=raw_output,
+        )
+        try:
+            reply = await llm.complete(
+                [{"role": "user", "content": prompt}],
+                model=FAST_MODEL,
+                max_tokens=3000,
+            )
+        except Exception:
+            reply = "{}"
+        try:
+            parsed = json.loads(reply) if reply and reply.strip() else {}
+            for f in parsed.get("findings", []):
+                f.setdefault("id", f"scan_{len(all_findings)}")
+                f["audit_type"] = check.get("type", "initial_scan")
+                f["discovered_by"] = "initial_scan"
+                f["risk_score"] = 0.7 if f.get("severity") in ("CRITICAL", "HIGH") else 0.4
+                f.setdefault("remediation", "")
+                f.setdefault("cis_benchmark", None)
+                f.setdefault("reasoning_chain", None)
+                f.setdefault("context", {})
+                all_findings.append(f)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        total_tokens_used += 1500  # approximate per LLM call
+
+    token_remaining = max(0, TOKEN_BUDGET - total_tokens_used)
+
     return {
-        "initial_findings": mock_findings,
-        "all_findings": mock_findings,
+        "initial_findings": all_findings,
+        "all_findings": all_findings,
+        "tokens_used": total_tokens_used,
+        "token_budget_remaining": token_remaining,
         "current_phase": "initial_scan_complete",
         "phase_progress": 0.35,
-        "audit_log": state.get("audit_log", []) + [{"timestamp": datetime.utcnow().isoformat(), "event": "initial_scan_complete", "findings_count": len(mock_findings)}],
+        "audit_types_executed": list({c.get("type", "general") for c in active_checks.values()}),
+        "audit_log": state.get("audit_log", []) + [
+            {"timestamp": datetime.utcnow().isoformat(), "event": "initial_scan_complete", "findings_count": len(all_findings)}
+        ],
     }
 
 
@@ -138,7 +297,10 @@ async def load_context_node(state: AuditStateV3) -> dict[str, Any]:
             "discovered_by": "load_context",
             "reasoning_chain": None,
         }]
+    scopes = resolve_scopes(state.get("scopes", ["all"]))
+    budget = calculate_budget(scopes, "dev")
     return {
+        "scopes": scopes,
         "external_targets": external_targets,
         "internal_targets": internal_targets,
         "jump_box_ip": jump_box_ip,
@@ -150,8 +312,8 @@ async def load_context_node(state: AuditStateV3) -> dict[str, Any]:
         "investigation_log": [],
         "attack_paths": [],
         "reasoning_chains": [],
-        "investigation_budget_total": INVESTIGATION_BUDGET,
-        "investigation_budget_remaining": INVESTIGATION_BUDGET,
+        "investigation_budget_total": budget,
+        "investigation_budget_remaining": budget,
         "investigation_depth_max": 5,
         "tokens_used": 0,
         "token_budget_remaining": TOKEN_BUDGET,
@@ -159,30 +321,141 @@ async def load_context_node(state: AuditStateV3) -> dict[str, Any]:
         "phase_progress": 0.30,
         "audit_types_executed": ["context_import"],
         "errors": [],
-        "audit_log": state.get("audit_log", []) + [{"timestamp": datetime.utcnow().isoformat(), "event": "context_loaded", "findings_count": len(initial_findings), "source": str(path)}],
+        "audit_log": state.get("audit_log", []) + [
+            {"timestamp": datetime.utcnow().isoformat(), "event": "context_loaded", "findings_count": len(initial_findings), "source": str(path), "scopes": scopes, "budget": budget},
+        ],
     }
 
 
+# Hypothesis templates by finding type (phase-3); context vars substituted from finding["context"]
+HYPOTHESIS_TEMPLATES: dict[str, list[dict]] = {
+    "security_group_allows_port": [
+        {"question": "Can {src_resource} reach {target_resource} on port {port}? Is there an IAM policy that also grants DB access?", "priority": 0.8, "audit_type": "network"},
+    ],
+    "iam_role_can_assume_role": [
+        {"question": "What is the full assumption chain from {role_name}? Does it reach Secrets Manager?", "priority": 0.9, "audit_type": "iam"},
+    ],
+    "iam_excessive_permissions": [
+        {"question": "The role {role_name} has broad permissions — which EC2 instances use this role? What could they modify?", "priority": 0.85, "audit_type": "iam"},
+    ],
+    "monitoring_broken": [
+        {"question": "The alarm references SNS topic {sns_arn} — does this topic actually exist?", "priority": 0.7, "audit_type": "monitoring", "investigation_commands": ["aws sns get-topic-attributes --topic-arn {sns_arn}"]},
+    ],
+    "cloudtrail_not_logging": [
+        {"question": "CloudTrail is stopped. What does the S3 bucket policy look like? Is it blocking writes?", "priority": 0.8, "audit_type": "monitoring", "investigation_commands": ["aws s3api get-bucket-policy --bucket {bucket_name}"]},
+    ],
+    "nacl_bypass_via_route": [
+        {"question": "NACL denies {denied_cidr} but there may be a route that bypasses it. Check NAT/VPN.", "priority": 0.85, "audit_type": "network"},
+    ],
+    "encryption_disabled": [
+        {"question": "RDS storage is unencrypted. Is there a KMS key available? Check key rotation.", "priority": 0.7, "audit_type": "data", "investigation_commands": ["aws kms list-keys --output json"]},
+    ],
+    "imds_v1_enabled": [
+        {"question": "Instance {instance_id} has IMDSv1 enabled. What IAM role is attached? Could SSRF lead to credential theft?", "priority": 0.8, "audit_type": "compute"},
+    ],
+    "lambda_wrong_role": [
+        {"question": "Lambda {function_name} uses role {wrong_role} — what policies does this role have?", "priority": 0.75, "audit_type": "lambda", "investigation_commands": ["aws iam list-role-policies --role-name {wrong_role}", "aws iam list-attached-role-policies --role-name {wrong_role}"]},
+    ],
+    "s3_conditional_public": [
+        {"question": "Bucket {bucket_name} has Principal=* with a tag condition — what is the public access block config?", "priority": 0.8, "audit_type": "data", "investigation_commands": ["aws s3api get-bucket-policy --bucket {bucket_name}", "aws s3api get-public-access-block --bucket {bucket_name}"]},
+    ],
+    "kms_rotation_disabled": [
+        {"question": "KMS key {key_id} — is key rotation enabled?", "priority": 0.7, "audit_type": "data", "investigation_commands": ["aws kms get-key-rotation-status --key-id {key_id}"]},
+    ],
+    "userdata_insecure_binding": [
+        {"question": "Instance {instance_id} may have insecure user-data. Check for 0.0.0.0 bindings, cron jobs, hardcoded secrets.", "priority": 0.85, "audit_type": "compute", "investigation_commands": ["aws ec2 describe-instance-attribute --instance-id {instance_id} --attribute userData"]},
+    ],
+    "general": [
+        {"question": "What resources are affected by this finding? How could it combine with others?", "priority": 0.6, "audit_type": "general"},
+    ],
+}
+
+HYPOTHESIS_PROMPT = """You are an autonomous security auditor analyzing findings to generate hypotheses.
+
+CURRENT FINDINGS:
+{findings_summary}
+
+ALREADY INVESTIGATED:
+{investigated_summary}
+
+Generate 3-5 NEW hypotheses that:
+1. Connect dots between multiple findings (composite vulnerabilities)
+2. Investigate findings that need deeper commands
+3. Look for attack paths (entry point → lateral movement → data access)
+
+For each hypothesis, include what AWS CLI command(s) should be run to investigate it.
+
+Output as JSON array only:
+[
+  {{"id": "llm_hyp_N", "question": "What happens if...", "priority": 0.9, "triggered_by": "finding_id or llm_reasoning", "audit_type": "scope_name", "investigation_commands": ["aws ec2 describe-instance-attribute --instance-id i-xxx --attribute userData"]}}
+]
+
+Return ONLY valid JSON."""
+
+
 async def hypothesis_generation_node(state: AuditStateV3) -> dict[str, Any]:
-    """From all_findings generate/update hypotheses (template-based and/or one LLM call)."""
+    """Template-based hypotheses from finding types + LLM-generated hypotheses; merge and dedupe."""
     all_findings = state.get("all_findings", [])
     existing = state.get("hypotheses", [])
     existing_ids = {h["id"] for h in existing}
-    new_hyps = []
-    for f in all_findings:
-        if f.get("type") in ("security_group_allows_port", "iam_role_can_assume_role", "general"):
-            hid = f"hyp_{f.get('id', 'x')}_1"
-            if hid not in existing_ids:
-                new_hyps.append({
-                    "id": hid,
-                    "question": f"What resources are affected by: {f.get('title', '')}?",
-                    "triggered_by": f.get("id", ""),
-                    "audit_type": f.get("audit_type", "general"),
-                    "priority": 0.6,
-                    "status": "pending",
-                    "depth": 0,
-                })
-                existing_ids.add(hid)
+    new_hyps: list[dict] = []
+
+    # Template-driven
+    for finding in all_findings:
+        ftype = finding.get("type", "general")
+        context = finding.get("context", {}) or {}
+        templates = HYPOTHESIS_TEMPLATES.get(ftype) or HYPOTHESIS_TEMPLATES.get("general", [])
+        for idx, tmpl in enumerate(templates):
+            hid = f"hyp_{finding.get('id', 'x')}_{ftype}_{idx}"
+            if hid in existing_ids:
+                continue
+            question = tmpl.get("question", "").replace("{{", "{").replace("}}", "}")
+            for k, v in context.items():
+                question = question.replace(f"{{{k}}}", str(v))
+            inv_cmds = list(tmpl.get("investigation_commands", []))
+            for k, v in context.items():
+                inv_cmds = [c.replace(f"{{{k}}}", str(v)) for c in inv_cmds]
+            new_hyps.append({
+                "id": hid,
+                "question": question or f"What is the impact of: {finding.get('title', '')}?",
+                "status": "pending",
+                "priority": tmpl.get("priority", 0.6),
+                "triggered_by": finding.get("id", ""),
+                "audit_type": tmpl.get("audit_type", finding.get("audit_type", "general")),
+                "depth": 0,
+                "investigation_commands": inv_cmds if inv_cmds else None,
+            })
+            existing_ids.add(hid)
+
+    # LLM-driven
+    if all_findings:
+        findings_summary = "\n".join(
+            f"[{f.get('id','?')}] [{f.get('severity','INFO')}] {f.get('title','?')} (type={f.get('type','?')})"
+            for f in all_findings[:20]
+        )
+        investigated_summary = "\n".join(
+            f"- {h['question']} → {h.get('status','pending')}"
+            for h in existing if h.get("status") != "pending"
+        ) or "None yet"
+        llm = get_llm()
+        try:
+            reply = await llm.complete(
+                [{"role": "user", "content": HYPOTHESIS_PROMPT.format(findings_summary=findings_summary, investigated_summary=investigated_summary)}],
+                model=FAST_MODEL,
+                max_tokens=2000,
+            )
+            parsed = json.loads(reply) if reply and reply.strip() else []
+            if isinstance(parsed, list):
+                for hyp in parsed:
+                    if hyp.get("id") and hyp["id"] not in existing_ids:
+                        hyp.setdefault("status", "pending")
+                        hyp.setdefault("depth", 0)
+                        hyp.setdefault("investigation_commands", hyp.get("investigation_commands", []))
+                        new_hyps.append(hyp)
+                        existing_ids.add(hyp["id"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     combined = existing + new_hyps
     return {
         "hypotheses": combined,
@@ -191,52 +464,243 @@ async def hypothesis_generation_node(state: AuditStateV3) -> dict[str, Any]:
     }
 
 
+def _determine_investigation_commands(hypothesis: dict) -> list[str]:
+    """Map hypothesis to AWS CLI commands: explicit investigation_commands first, else keyword fallbacks."""
+    explicit = hypothesis.get("investigation_commands") or []
+    if explicit:
+        return [c for c in explicit if isinstance(c, str)][:5]
+    question = (hypothesis.get("question") or "").lower()
+    commands: list[str] = []
+    if "user-data" in question or "userdata" in question or "user data" in question:
+        ctx = hypothesis.get("context", {}) or {}
+        iid = ctx.get("instance_id", "")
+        if iid:
+            commands.append(f"aws ec2 describe-instance-attribute --instance-id {iid} --attribute userData")
+    if "security group" in question or " sg " in question:
+        commands.append("aws ec2 describe-security-groups --output json")
+    if "assume" in question or "role" in question or "iam" in question:
+        commands.append("aws iam list-roles --output json")
+    if "nacl" in question or "route" in question:
+        commands.append("aws ec2 describe-network-acls --output json")
+        commands.append("aws ec2 describe-route-tables --output json")
+    if "sns" in question or "alarm" in question or "cloudwatch" in question:
+        commands.append("aws cloudwatch describe-alarms --output json")
+        commands.append("aws sns list-topics --output json")
+    if "cloudtrail" in question or "logging" in question:
+        commands.append("aws cloudtrail get-trail-status --name audit-demo-trail --output json")
+    if "s3" in question or "bucket" in question:
+        commands.append("aws s3api list-buckets --output json")
+    if "kms" in question or "rotation" in question:
+        commands.append("aws kms list-keys --output json")
+    if "lambda" in question:
+        commands.append("aws lambda list-functions --output json")
+    if "secret" in question:
+        commands.append("aws secretsmanager list-secrets --output json")
+    if "imds" in question or "metadata" in question:
+        commands.append("aws ec2 describe-instances --query \"Reservations[].Instances[].{Id:InstanceId,MetadataOptions:MetadataOptions}\" --output json")
+    if not commands:
+        commands = ["aws ec2 describe-instances --output json"]
+    return commands[:5]
+
+
+INVESTIGATION_PROMPT = """You are an autonomous security investigator.
+
+HYPOTHESIS: {hypothesis}
+
+INVESTIGATION COMMANDS AND RESULTS:
+{command_outputs}
+
+Analyze thoroughly and produce JSON:
+{{
+    "hypothesis_status": "confirmed|rejected|inconclusive",
+    "evidence_summary": "What the data shows",
+    "confidence": 0.0-1.0,
+    "new_findings": [
+        {{
+            "id": "deep_N",
+            "title": "Short title",
+            "type": "finding_type",
+            "severity": "CRITICAL|HIGH|MEDIUM|LOW",
+            "description": "Full description",
+            "evidence": "Raw evidence data",
+            "context": {{}},
+            "remediation": "How to fix"
+        }}
+    ],
+    "new_questions": ["Follow-up questions that emerged"]
+}}
+
+Return ONLY valid JSON."""
+
+
 async def deep_investigation_node(state: AuditStateV3) -> dict[str, Any]:
-    """Pick top N pending hypotheses; stub investigate; append investigation_log and deep_findings; decrement budget."""
+    """Pick top pending hypotheses; run commands via executor; LLM analysis; update log and deep_findings."""
     hypotheses = list(state.get("hypotheses", []))
     budget = state.get("investigation_budget_remaining", 0)
-    pending = sorted([h for h in hypotheses if h.get("status") == "pending"], key=lambda h: h.get("priority", 0), reverse=True)
+    pending = sorted(
+        [h for h in hypotheses if h.get("status") == "pending"],
+        key=lambda h: h.get("priority", 0),
+        reverse=True,
+    )
     if not pending or budget <= 0:
         return {"current_phase": "investigation_complete", "investigation_budget_remaining": budget}
-    batch_size = min(2, len(pending), budget)
+    batch_size = min(3, len(pending), budget)
     batch = pending[:batch_size]
+    executor = SecureToolExecutor()
+    llm = get_llm()
     new_log: list[InvestigationRecord] = list(state.get("investigation_log", []))
     new_deep: list[AuditFinding] = list(state.get("deep_findings", []))
+    all_findings = list(state.get("all_findings", []))
+    tokens_used = state.get("tokens_used", 0)
+
     for h in batch:
-        h["status"] = "rejected"
-        h["result"] = "Stub investigation — no real commands run."
+        commands = _determine_investigation_commands(h)
+        outputs: list[str] = []
+        cmds_run: list[str] = []
+        for cmd in commands:
+            result = await executor.execute(cmd, timeout=30)
+            outputs.append(f"[{cmd}]\n{(result.stdout or '').strip()[:3000]}")
+            cmds_run.append(cmd)
+        command_outputs = "\n\n".join(outputs)
+
+        try:
+            reply = await llm.complete(
+                [{"role": "user", "content": INVESTIGATION_PROMPT.format(hypothesis=h.get("question", ""), command_outputs=command_outputs)}],
+                model=FAST_MODEL,
+                max_tokens=3000,
+            )
+            parsed = json.loads(reply) if reply and reply.strip() else {}
+        except (json.JSONDecodeError, TypeError):
+            parsed = {}
+        tokens_used += 2000
+
+        h["status"] = parsed.get("hypothesis_status", "inconclusive")
+        h["result"] = parsed.get("evidence_summary", "")
+        found_new = False
+        for i, f in enumerate(parsed.get("new_findings", [])):
+            f.setdefault("id", f"deep_{len(new_deep) + i}")
+            f["discovered_by"] = h.get("id", "unknown")
+            f["audit_type"] = h.get("audit_type", "deep_investigation")
+            f.setdefault("risk_score", 0.8 if f.get("severity") in ("CRITICAL", "HIGH") else 0.5)
+            f.setdefault("cis_benchmark", None)
+            f.setdefault("reasoning_chain", None)
+            f.setdefault("context", {})
+            new_deep.append(f)
+            all_findings.append(f)
+            found_new = True
         new_log.append({
             "hypothesis_id": h["id"],
             "question": h.get("question", ""),
-            "commands_run": [],
-            "result": "Stub",
-            "found_new_finding": False,
+            "commands_run": cmds_run,
+            "result": h.get("result", ""),
+            "found_new_finding": found_new,
             "depth": h.get("depth", 0),
             "timestamp": datetime.utcnow().isoformat(),
         })
+
     return {
         "hypotheses": hypotheses,
         "investigation_log": new_log,
         "deep_findings": new_deep,
+        "all_findings": all_findings,
         "investigation_budget_remaining": max(0, budget - batch_size),
+        "tokens_used": tokens_used,
+        "token_budget_remaining": max(0, TOKEN_BUDGET - tokens_used),
         "current_phase": "deep_investigation",
-        "phase_progress": max(state.get("phase_progress", 0), 0.6),
+        "phase_progress": min(0.7, state.get("phase_progress", 0.4) + 0.05),
     }
 
 
-async def attack_graph_node(state: AuditStateV3) -> dict[str, Any]:
-    """From findings build a simple attack_paths list (and optionally Mermaid)."""
-    all_findings = state.get("all_findings", [])
-    paths = []
-    for f in all_findings[:5]:
-        if f.get("severity") in ("CRITICAL", "HIGH"):
+def _attack_graph_builder_find_paths(
+    nodes: dict[str, dict],
+    edges: list[dict],
+) -> list[dict]:
+    """Build adjacency from edges; DFS from non-critical to critical; return top 10 paths."""
+    adj: dict[str, list[str]] = defaultdict(list)
+    for e in edges:
+        src = e.get("source", "")
+        tgt = e.get("target", "")
+        if src and tgt:
+            adj[src].append(tgt)
+    critical_ids = {nid for nid, n in nodes.items() if n.get("is_critical")}
+    paths: list[dict] = []
+
+    def dfs(current: str, path: list[str], visited: set) -> None:
+        if current in visited:
+            return
+        visited.add(current)
+        path.append(current)
+        if current in critical_ids and len(path) > 1:
+            path_findings = []
+            for i in range(len(path) - 1):
+                for e in edges:
+                    if e.get("source") == path[i] and e.get("target") == path[i + 1]:
+                        path_findings.append(e.get("finding_id", ""))
             paths.append({
-                "entry_point": "stub",
-                "target": f.get("id", "unknown"),
-                "path": [{"from": "stub", "to": f.get("id", ""), "via": f.get("type", "related")}],
-                "composite_risk": f.get("risk_score", 0.5),
-                "findings_involved": [f.get("id", "")],
+                "entry_point": path[0],
+                "target": current,
+                "path": [{"node": n, "name": nodes.get(n, {}).get("name", n)} for n in path],
+                "composite_risk": min(1.0, 0.3 * len(path)),
+                "findings_involved": path_findings,
             })
+        for neighbor in adj.get(current, []):
+            if neighbor not in visited:
+                dfs(neighbor, list(path), visited)
+        visited.discard(current)
+
+    for nid, node in nodes.items():
+        if not node.get("is_critical"):
+            dfs(nid, [], set())
+    return paths[:10]
+
+
+ATTACK_GRAPH_PROMPT = """You are building an attack graph from security findings.
+
+FINDINGS:
+{findings_json}
+
+Identify attack paths — sequences of findings that, when chained, create a path from an entry point to a critical asset (secrets, databases, admin roles).
+
+Output JSON:
+{{
+  "nodes": [
+    {{"id": "resource_id", "type": "ec2|iam_role|rds|s3|lambda|secret", "name": "human name", "is_critical": false}}
+  ],
+  "edges": [
+    {{"source": "id1", "target": "id2", "relationship": "can_assume|can_reach|has_access", "finding_id": "scan_N"}}
+  ]
+}}
+
+Return ONLY valid JSON."""
+
+
+async def attack_graph_node(state: AuditStateV3) -> dict[str, Any]:
+    """LLM builds nodes/edges from findings; then DFS to find critical paths."""
+    all_findings = state.get("all_findings", [])
+    llm = get_llm()
+    findings_json = json.dumps(all_findings[:30], indent=2)
+    try:
+        reply = await llm.complete(
+            [{"role": "user", "content": ATTACK_GRAPH_PROMPT.format(findings_json=findings_json)}],
+            model=DEEP_MODEL,
+            max_tokens=3000,
+        )
+        data = json.loads(reply) if reply and reply.strip() else {}
+    except (json.JSONDecodeError, TypeError):
+        data = {}
+    nodes = {n["id"]: n for n in data.get("nodes", []) if n.get("id")}
+    edges = data.get("edges", [])
+    paths = _attack_graph_builder_find_paths(nodes, edges)
+    if not paths and all_findings:
+        for f in all_findings[:5]:
+            if f.get("severity") in ("CRITICAL", "HIGH"):
+                paths.append({
+                    "entry_point": "entry",
+                    "target": f.get("id", "unknown"),
+                    "path": [{"node": f.get("id", ""), "name": f.get("title", "")}],
+                    "composite_risk": f.get("risk_score", 0.5),
+                    "findings_involved": [f.get("id", "")],
+                })
     return {
         "attack_paths": paths,
         "current_phase": "attack_graph_complete",
@@ -244,41 +708,148 @@ async def attack_graph_node(state: AuditStateV3) -> dict[str, Any]:
     }
 
 
+REASONING_PROMPT = """You are a senior security analyst performing deep reasoning on audit findings.
+
+CRITICAL/HIGH FINDINGS:
+{critical_findings}
+
+ATTACK PATHS:
+{attack_paths}
+
+For each critical finding, produce a reasoning chain:
+1. What was observed (evidence)
+2. Why it matters (impact)
+3. How it connects to other findings (composite risk)
+4. What an attacker could do (exploit scenario)
+5. Severity justification
+
+Output JSON:
+{{
+  "reasoning_chains": [
+    {{
+      "finding_id": "scan_N",
+      "steps": ["Step 1: ...", "Step 2: ..."],
+      "conclusion": "This finding combined with X creates Y risk",
+      "severity_justification": "Why CRITICAL/HIGH",
+      "composite_risk_score": 0.9
+    }}
+  ],
+  "executive_summary": "2-3 sentence summary for executives"
+}}
+
+Return ONLY valid JSON."""
+
+
 async def reasoning_node(state: AuditStateV3) -> dict[str, Any]:
-    """For CRITICAL/HIGH findings call LLM to produce reasoning_chains."""
+    """DEEP_MODEL: reasoning chains for CRITICAL/HIGH findings and executive summary."""
     all_findings = state.get("all_findings", [])
-    critical = [f for f in all_findings if f.get("severity") in ("CRITICAL", "HIGH")][:5]
-    chains = []
-    for f in critical:
-        chains.append({
-            "finding_id": f.get("id", ""),
-            "reasoning_steps": [f"Discovered: {f.get('title', '')}", "Stub reasoning — wire LLM for full V3."],
-            "conclusion": f"{f.get('severity', 'HIGH')} finding requires attention.",
-            "severity": f.get("severity", "HIGH"),
-        })
+    attack_paths = state.get("attack_paths", [])
+    critical_findings = [f for f in all_findings if f.get("severity") in ("CRITICAL", "HIGH")][:15]
+    llm = get_llm()
+    try:
+        reply = await llm.complete(
+            [{
+                "role": "user",
+                "content": REASONING_PROMPT.format(
+                    critical_findings=json.dumps(critical_findings, indent=2),
+                    attack_paths=json.dumps(attack_paths[:5], indent=2),
+                ),
+            }],
+            model=DEEP_MODEL,
+            max_tokens=4000,
+        )
+        data = json.loads(reply) if reply and reply.strip() else {}
+    except (json.JSONDecodeError, TypeError):
+        data = {}
+    reasoning_chains = data.get("reasoning_chains", [])
+    executive_summary = data.get("executive_summary", "")
+    if not reasoning_chains and critical_findings:
+        reasoning_chains = [
+            {
+                "finding_id": f.get("id", ""),
+                "steps": [f"Discovered: {f.get('title', '')}", "Requires remediation."],
+                "conclusion": f"{f.get('severity', 'HIGH')} finding.",
+                "severity_justification": "See finding.",
+                "composite_risk_score": f.get("risk_score", 0.5),
+            }
+            for f in critical_findings[:5]
+        ]
     return {
-        "reasoning_chains": chains,
+        "reasoning_chains": reasoning_chains,
+        "executive_summary": executive_summary,
         "current_phase": "reasoning_complete",
         "phase_progress": 0.9,
     }
 
 
+REPORT_PROMPT = """You are generating a professional infrastructure security audit report.
+
+AUDIT SUMMARY:
+- Total findings: {total_findings}
+- Critical: {critical_count}
+- High: {high_count}
+- Medium: {medium_count}
+- Low: {low_count}
+- Attack paths identified: {attack_path_count}
+
+EXECUTIVE SUMMARY:
+{executive_summary}
+
+ALL FINDINGS:
+{findings_json}
+
+ATTACK PATHS:
+{attack_paths_json}
+
+REASONING CHAINS:
+{reasoning_json}
+
+Generate a complete Markdown report with these sections:
+1. Executive Summary (2-3 paragraphs)
+2. Critical Findings (detailed, with evidence and remediation)
+3. High-Priority Findings
+4. Medium/Low Findings (summarized)
+5. Attack Path Analysis (visual chains using arrows)
+6. Recommendations (prioritized action items)
+7. Methodology (what was checked)
+
+Make it professional but readable. Include specific resource IDs and evidence."""
+
+
 async def report_generation_node(state: AuditStateV3) -> dict[str, Any]:
-    """Single LLM call to produce external_report and executive_summary."""
-    llm = get_llm()
+    """DEEP_MODEL: full markdown report from findings, attack paths, reasoning chains."""
     all_findings = state.get("all_findings", [])
     attack_paths = state.get("attack_paths", [])
-    prompt = f"""You are a security auditor. Write a very short audit report (2-3 paragraphs) based on:
-Findings count: {len(all_findings)}
-Attack paths count: {len(attack_paths)}
-Severity breakdown: {json.dumps([f.get('severity') for f in all_findings])}
-
-Include an "Executive Summary" section and a "Findings" section. Use markdown."""
+    reasoning_chains = state.get("reasoning_chains", [])
+    executive_summary = state.get("executive_summary", "")
+    severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for f in all_findings:
+        sev = f.get("severity", "INFO")
+        severity_counts[sev] = severity_counts.get(sev, 0) + 1
+    llm = get_llm()
     try:
-        report = await llm.complete([{"role": "user", "content": prompt}], model=DEEP_MODEL, max_tokens=1500)
+        report = await llm.complete(
+            [{
+                "role": "user",
+                "content": REPORT_PROMPT.format(
+                    total_findings=len(all_findings),
+                    critical_count=severity_counts["CRITICAL"],
+                    high_count=severity_counts["HIGH"],
+                    medium_count=severity_counts["MEDIUM"],
+                    low_count=severity_counts["LOW"],
+                    attack_path_count=len(attack_paths),
+                    executive_summary=executive_summary,
+                    findings_json=json.dumps(all_findings, indent=2),
+                    attack_paths_json=json.dumps(attack_paths, indent=2),
+                    reasoning_json=json.dumps(reasoning_chains, indent=2),
+                ),
+            }],
+            model=DEEP_MODEL,
+            max_tokens=8000,
+        )
     except Exception:
-        report = "# ARGUS Audit Report\n\n## Executive Summary\n\nStub report — pipeline wired; LLM may have failed.\n\n## Findings\n\nSee state for details."
-    summary = report[:500] + "..." if len(report) > 500 else report
+        report = "# ARGUS Audit Report\n\n## Executive Summary\n\nPipeline complete; LLM report generation failed.\n\n## Findings\n\nSee state for details."
+    summary = (state.get("executive_summary") or report[:500] or "") + ("..." if len(report) > 500 else "")
     return {
         "external_report": report,
         "executive_summary": summary,

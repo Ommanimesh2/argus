@@ -45,6 +45,7 @@ class AuditStateV3(TypedDict, total=False):
     ssh_key_path: str
     aws_region: str
     scope_tag: str
+    scopes: list[str]  # e.g. ["iam", "compute", "monitoring"] or ["all"]
     context_file_path: Optional[str]
 
     # Auto-discovered or from load_context

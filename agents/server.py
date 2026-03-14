@@ -5,14 +5,14 @@ API-first; LangGraph V3 pipeline wired behind these endpoints.
 import asyncio
 import json
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from agents.config import ORIGINS, get_required_api_key
+from agents.config import ORIGINS, get_required_api_key, logger, AUDIT_MODE
 from agents.graph.workflow import run_audit_graph
 
 app = FastAPI(
@@ -41,6 +41,8 @@ class AuditStartRequest(BaseModel):
     jump_box_ip: str = ""
     ssh_key_path: str = ""
     environment_context: dict[str, Any] = Field(default_factory=dict)
+    scopes: list[str] = Field(default_factory=lambda: ["all"])
+    context_file_path: Optional[str] = None
 
 
 class AuditStartResponse(BaseModel):
@@ -64,6 +66,10 @@ async def health():
 async def start_audit(body: AuditStartRequest, background_tasks: BackgroundTasks):
     """Start a new audit. Returns audit_id and URLs for stream/report."""
     audit_id = str(uuid.uuid4())
+    logger.info(
+        "audit start audit_id=%s mode=%s scopes=%s context_file=%s",
+        audit_id, AUDIT_MODE, body.scopes, getattr(body, "context_file_path", None),
+    )
     _audits[audit_id] = {
         "config": body.model_dump(),
         "phase": "starting",
@@ -79,6 +85,7 @@ async def start_audit(body: AuditStartRequest, background_tasks: BackgroundTasks
 
     async def run():
         try:
+            logger.info("audit run started audit_id=%s", audit_id)
             body_dict = body.model_dump()
             final = await run_audit_graph(audit_id, body_dict, append_event)
             if final:
@@ -87,8 +94,15 @@ async def start_audit(body: AuditStartRequest, background_tasks: BackgroundTasks
                 _audits[audit_id]["findings"] = final.get("all_findings", [])
                 _audits[audit_id]["report"] = final.get("external_report") or final.get("executive_summary", "")
                 _audits[audit_id]["attack_paths"] = final.get("attack_paths", [])
+                logger.info(
+                    "audit run finished audit_id=%s phase=%s findings=%s",
+                    audit_id, final.get("current_phase"), len(final.get("all_findings", [])),
+                )
+            else:
+                logger.warning("audit run finished with no final state audit_id=%s", audit_id)
             _audits[audit_id]["finished"] = True
         except Exception as e:
+            logger.exception("audit run error audit_id=%s", audit_id)
             append_event(audit_id, {"type": "error", "error": str(e)})
             _audits[audit_id]["phase"] = "error"
             _audits[audit_id]["finished"] = True
