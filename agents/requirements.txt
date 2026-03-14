@@ -1,0 +1,19 @@
+# ARGUS Agents — LangGraph pipeline + APIs (Claude + OpenAI)
+
+# LangGraph & state machine
+langgraph
+
+# LLM providers
+anthropic
+openai
+
+# API server
+fastapi
+uvicorn[standard]
+
+# Data validation & env
+pydantic
+python-dotenv
+
+# Async (used by LangGraph / FastAPI)
+aiohttp

@@ -1,0 +1,45 @@
+"""
+ARGUS Agents — config from env.
+Supports Claude and OpenAI; which key is required depends on LLM_PROVIDER.
+"""
+import os
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    _env_dir = Path(__file__).resolve().parent
+    load_dotenv(_env_dir / ".env")
+    load_dotenv(_env_dir.parent / ".env")
+except Exception:
+    pass
+
+# LLM provider: "claude" | "openai"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "claude").strip().lower()
+if LLM_PROVIDER not in ("claude", "openai"):
+    LLM_PROVIDER = "claude"
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+# Server
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info").lower()
+ORIGINS = [o.strip() for o in os.getenv("ORIGINS", "http://localhost:3000").split(",") if o.strip()]
+
+# Audit defaults (used once pipeline is wired)
+AUDIT_TIMEOUT_SECONDS = int(os.getenv("AUDIT_TIMEOUT_SECONDS", "300"))
+COMMAND_TIMEOUT_SECONDS = int(os.getenv("COMMAND_TIMEOUT_SECONDS", "60"))
+
+
+def get_required_api_key() -> str:
+    """Return the API key required for the selected provider; raise if missing."""
+    if LLM_PROVIDER == "claude":
+        if not ANTHROPIC_API_KEY:
+            raise ValueError("LLM_PROVIDER=claude requires ANTHROPIC_API_KEY in .env")
+        return ANTHROPIC_API_KEY
+    if LLM_PROVIDER == "openai":
+        if not OPENAI_API_KEY:
+            raise ValueError("LLM_PROVIDER=openai requires OPENAI_API_KEY in .env")
+        return OPENAI_API_KEY
+    raise ValueError(f"Unsupported LLM_PROVIDER: {LLM_PROVIDER}")
